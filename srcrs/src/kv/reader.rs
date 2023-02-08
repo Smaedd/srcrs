@@ -45,7 +45,7 @@ pub struct Object {
 #[derive(Debug, PartialEq)]
 pub enum Value {
     String(String),
-    Object(Object), // TODO: Replace with generic map interface
+    Object(Object),
 }
 
 macro_rules! expect {

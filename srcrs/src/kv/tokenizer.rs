@@ -30,6 +30,7 @@ impl Error for TokenizerError {
 }
 
 const READ_SIZE: usize = 1024;
+const NUM_REWINDS: usize = 1;
 
 pub struct Tokenizer<R>
 where
@@ -37,7 +38,7 @@ where
 {
     reader: R,
 
-    last_read: [u8; READ_SIZE],
+    last_read: [u8; READ_SIZE + NUM_REWINDS], // To allow rewind of NUM_REWINDS at all times
     position: usize,
     max_read: usize
 }
@@ -55,18 +56,19 @@ const QUOTE: char = '"';
 const CANCEL: char = '\\';
 const OPEN_BLOCK: char = '{';
 const CLOSE_BLOCK: char = '}';
+const COMMENT: char = '/';
 
 
 impl<R: Read> Tokenizer<R> {
     pub fn from_io(mut read: R) -> Result<Self> {
-        let mut last_read = [0u8; READ_SIZE];
-        let max_read: usize = read.read(last_read.as_mut_slice())?;
+        let mut last_read = [0u8; READ_SIZE + NUM_REWINDS];
+        let max_read: usize = read.read(&mut last_read[NUM_REWINDS..])? + NUM_REWINDS;
 
         Ok(Self {
             reader: read,
 
             last_read: last_read,
-            position: 0,
+            position: NUM_REWINDS,
             max_read: max_read,
         })
     }
@@ -75,19 +77,38 @@ impl<R: Read> Tokenizer<R> {
         self.position += 1;
 
         if self.position >= self.max_read {
-            self.max_read = self.reader.read(self.last_read.as_mut_slice())?;
-            self.position = 0;
+            self.max_read = self.reader.read(self.last_read.as_mut_slice())? + NUM_REWINDS;
+            self.position = NUM_REWINDS;
         }
 
         Ok(())
     }
 
+    fn rewind(&mut self, old_val: char) {
+        assert!(self.position > 0);
+
+        self.position -= 1;
+        self.last_read[self.position] = old_val as u8;
+    }
+
     fn peek(&self) -> Option<char> {
-        if self.max_read == 0 {
+        if self.max_read == NUM_REWINDS {
             return None;
         }
 
         return Some(self.last_read[self.position] as char);
+    }
+
+    fn consume_comment(&mut self) -> Result<()> {
+        while let Some(data) = self.peek() {
+            if data == '\n' {
+                break;
+            }
+
+            self.advance()?;
+        }
+
+        Ok(())
     }
 
     fn consume_whitespace(&mut self) -> Result<()> {
@@ -118,6 +139,21 @@ impl<R: Read> Tokenizer<R> {
                 }
                 QUOTE => {
                     return Ok(Token::Text(self.read_quote_string()?));
+                }
+                COMMENT => {
+                    self.advance()?;
+
+                    if let Some(second_char) = self.peek() {
+                        if second_char == COMMENT {
+                            self.consume_comment()?;
+
+                            return self.next_token();
+                        }
+                    }
+
+                    self.rewind(COMMENT);
+
+                    return Ok(Token::Text(self.read_quoteless_string()?));
                 }
                 _ => {
                     return Ok(Token::Text(self.read_quoteless_string()?));
@@ -177,6 +213,24 @@ impl<R: Read> Tokenizer<R> {
                 None => break,
                 Some(data) => {
 
+                    // Handle comments mid-string
+                    if data == COMMENT {
+                        self.advance()?;
+                        
+                        if let Some(second_char) = self.peek() {
+                            if second_char == COMMENT {
+                                if cancelled {
+                                    string.push(CANCEL);
+                                }
+
+                                self.consume_comment()?;
+                                break;
+                            }
+                        }
+
+                        self.rewind(COMMENT);
+                    }
+
                     if cancelled {
                         cancelled = false;
                     } else {
@@ -190,7 +244,7 @@ impl<R: Read> Tokenizer<R> {
                         } else if Self::is_special_character(data) {
                             break;
                         }
-                    }
+                    } // check for comments regardless of cancellation
 
                     self.advance()?;
                     string.push(data);
@@ -297,6 +351,43 @@ mod tests {
             Token::OpenBlock,
             Token::CloseBlock,
             Token::Text(r#"ha {"#.into()),
+            Token::Text(r#"MULTIPLE LINES!!!!"#.into()),
+            Token::OpenBlock,
+            Token::CloseBlock,
+            Token::CloseBlock,
+            Token::CloseBlock,
+            Token::Text(r#"you kno"w"#.into()),
+            Token::Eof,
+        );
+
+        for token in tokens {
+            assert!(tokenizer.next_token().unwrap() == token);
+        }
+    }
+
+    #[test]
+    fn multiple_tokens_comments() {
+        let kv_data = r#"
+        "str1" / /{ "da\"ta" /moredata/} } {}"ha/ {" \// Hey there i am a comment
+        "MULTIPLE LINES!!!!"{}}}you\ kno"w
+        "#.as_bytes();
+
+
+        let mut tokenizer = Tokenizer::from_io(kv_data).unwrap();
+
+        let tokens = vec!(
+            Token::Text(r#"str1"#.into()),
+            Token::Text(r#"/"#.into()),
+            Token::Text(r#"/"#.into()),
+            Token::OpenBlock,
+            Token::Text(r#"da"ta"#.into()),
+            Token::Text(r#"/moredata/"#.into()),
+            Token::CloseBlock,
+            Token::CloseBlock,
+            Token::OpenBlock,
+            Token::CloseBlock,
+            Token::Text(r#"ha/ {"#.into()),
+            Token::Text(r#"\"#.into()),
             Token::Text(r#"MULTIPLE LINES!!!!"#.into()),
             Token::OpenBlock,
             Token::CloseBlock,

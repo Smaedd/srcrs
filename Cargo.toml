@@ -1,0 +1,6 @@
+[workspace]
+
+members = [
+    "srcrs",
+    "srcrs_test",
+]

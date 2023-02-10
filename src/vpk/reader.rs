@@ -47,9 +47,12 @@ const VPK_SIGNATURE: u32 = 0x55aa1234;
 const VPK_VERSION: u32 = 2;
 
 pub struct VPK {
+    path: PathBuf,
     base_path: PathBuf,
     files: HashMap<PathBuf, VPKFile>,
 }
+
+const DIRECTORY_INDEX: u16 = 0x7FFF;
 
 struct VPKFile {
     crc: u32,
@@ -57,7 +60,7 @@ struct VPKFile {
     preload_data: Vec<u8>,
 
     archive_index: u16,
-    archive_offset: u64, // Larger for 0x7FFF case
+    archive_offset: u64, // Larger for DIRECTORY_INDEX case
     archive_length: u32,
 }
 
@@ -76,6 +79,7 @@ impl VPK {
         };
 
         let mut vpk = VPK {
+            path: path.into(),
             base_path: base_path,
             files: HashMap::new(),
         };
@@ -153,6 +157,8 @@ impl VPK {
                 break;
             }
 
+            let extension = if extension == " " { "" } else { extension };
+
             loop {
                 let (num_read, path) = Self::read_string(&loaded_data[position..])?;
                 position += num_read;
@@ -161,6 +167,8 @@ impl VPK {
                     break;
                 }
 
+                let path = if path == " " { "" } else { path };
+
                 loop {
                     let (num_read, file_name) = Self::read_string(&loaded_data[position..])?;
                     position += num_read;
@@ -168,6 +176,8 @@ impl VPK {
                     if file_name.is_empty() {
                         break;
                     }
+
+                    let file_name = if file_name == " " { "" } else { file_name };
 
                     let mut full_path = PathBuf::from(path);
                     full_path.push(OsStr::new(file_name));
@@ -184,7 +194,7 @@ impl VPK {
                     );
                     position += directory_entry.preload_bytes as usize;
 
-                    let archive_offset = if directory_entry.archive_index == 0x7FFF {
+                    let archive_offset = if directory_entry.archive_index == DIRECTORY_INDEX {
                         directory_entry.entry_offset as u64 + header_offset as u64
                     } else {
                         directory_entry.entry_offset as u64
@@ -244,17 +254,23 @@ impl VPK {
             });
         }
 
-        let archive_name = {
+        let archive_name = if entry.archive_index == DIRECTORY_INDEX {
+            self.path.clone()
+        } else {
             let mut file_prefix =
                 OsString::from(self.base_path.with_extension("").file_name().unwrap());
+
             file_prefix.push(format!("_{:03}", entry.archive_index));
             self.base_path
                 .with_file_name(file_prefix)
                 .with_extension(self.base_path.extension().unwrap())
         };
 
+        let mut fs_file = fs::File::open(archive_name)?;
+        fs_file.seek(SeekFrom::Start(entry.archive_offset))?;
+
         Ok(File {
-            fs_file: Some(fs::File::open(archive_name)?),
+            fs_file: Some(fs_file),
             metadata: entry,
             position: 0,
         })

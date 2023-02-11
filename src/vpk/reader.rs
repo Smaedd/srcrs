@@ -342,10 +342,52 @@ impl<'a> Seek for File<'a> {
 
         Ok(self.position)
     }
+
+    #[cfg(seek_stream_len)]
+    fn stream_len(&mut self) -> Result<u64> {
+        Ok(self.metadata.archive_length as u64)
+    }
+
+    fn stream_position(&mut self) -> Result<u64> {
+        Ok(self.position)
+    }
 }
 
 impl<'a> File<'a> {
     pub fn len(&self) -> usize {
         self.metadata.archive_length as usize
+    }
+
+    pub fn verify(&mut self) -> Result<()> {
+        let old_position = self.stream_position()?;
+
+        let crc_maybe = self.calc_crc32();
+        self.seek(SeekFrom::Start(old_position))?;
+
+        match crc_maybe {
+            Ok(crc) => {
+                if crc != self.metadata.crc {
+                    Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "Calculated crc {} does not match stored crc {}",
+                            crc, self.metadata.crc
+                        ),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn calc_crc32(&mut self) -> Result<u32> {
+        self.seek(SeekFrom::Start(0))?;
+
+        let mut data = vec![0; self.len()];
+        self.read(data.as_mut_slice())?;
+
+        Ok(crc32fast::hash(&data))
     }
 }

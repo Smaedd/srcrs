@@ -13,6 +13,7 @@ fn test_chunk_vpk() {
     let mut vpk = VPK::load(Path::new("test-data/Misc_dir.vpk")).unwrap();
 
     let mut chapter1 = vpk.get(Path::new("cfg/chapter1.cfg")).unwrap();
+    chapter1.verify().unwrap();
 
     let chapter1_truth = include_bytes!("../../test-data/chapter1.cfg");
 
@@ -39,6 +40,7 @@ fn test_chunkless_vpk() {
     let mut vpk = VPK::load(Path::new("test-data/blastoffold.vpk")).unwrap();
 
     let mut blastoff = vpk.get(Path::new("blastoff.nut")).unwrap();
+    blastoff.verify().unwrap();
 
     let blastoff_truth = include_bytes!("../../test-data/blastoff.nut");
 

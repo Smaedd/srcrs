@@ -1,4 +1,4 @@
 mod reader;
-mod tokenizer;
+mod char_reader;
 
 pub use reader::*;

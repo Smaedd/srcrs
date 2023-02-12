@@ -1,31 +1,50 @@
-use std::collections::HashMap;
+use std::borrow::Borrow;
+use std::collections::{HashMap, HashSet};
+use std::error::Error;
 use std::fmt;
-use std::{error::Error, io::Read};
+use std::hash::Hash;
+use std::io::Read;
 
-use super::tokenizer::{Token, Tokenizer, TokenizerError};
+use super::char_reader::{CharReader, ReadChar};
+
+#[derive(Debug, PartialEq)]
+pub enum Token {
+    OpenBlock,
+    CloseBlock,
+    Text(String),
+    Eof,
+}
+
+const BASE_STRING_SIZE: usize = 1024;
+const QUOTE: char = '"';
+const OPEN_BLOCK: char = '{';
+const CLOSE_BLOCK: char = '}';
+const OPEN_FLAG: char = '[';
+const CLOSE_FLAG: char = ']';
+const NEGATE: char = '!';
 
 #[derive(Debug)]
 pub enum ReaderError {
-    Tokenizer(TokenizerError),
-    InvalidToken(Token),
+    IO(std::io::Error),
+    InvalidChar(ReadChar),
+    UnexpectedEof,
 }
 pub type Result<T> = std::result::Result<T, ReaderError>;
 
-impl From<TokenizerError> for ReaderError {
-    fn from(err: TokenizerError) -> ReaderError {
-        ReaderError::Tokenizer(err)
+impl From<std::io::Error> for ReaderError {
+    fn from(err: std::io::Error) -> ReaderError {
+        ReaderError::IO(err)
     }
 }
 
 impl fmt::Display for ReaderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ReaderError::Tokenizer(err) => write!(
-                f,
-                "Tokenizer error enounctered in reading:\n\t{}",
-                err.to_string()
-            ),
-            ReaderError::InvalidToken(token) => write!(f, "Invalid token: {token:?}"),
+            ReaderError::IO(err) => {
+                write!(f, "IO error encountered in reading:\n\t{}", err.to_string())
+            }
+            ReaderError::InvalidChar(data) => write!(f, "Invalid char: {data:?}"),
+            ReaderError::UnexpectedEof => write!(f, "Unexpected EOF"),
         }
     }
 }
@@ -33,36 +52,32 @@ impl fmt::Display for ReaderError {
 impl Error for ReaderError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            ReaderError::Tokenizer(ref err) => Some(err),
-            ReaderError::InvalidToken(_) => None,
+            ReaderError::IO(ref err) => Some(err),
+            ReaderError::InvalidChar(_) => None,
+            ReaderError::UnexpectedEof => None,
         }
     }
 }
 
 /// Represents a generic KV object.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default)]
 pub struct Object {
-    pub kv: HashMap<String, Value>,
+    kv: HashMap<String, (Flag, Value)>,
 }
 
 /// Represents a generic KV value.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum Value {
     String(String),
     Object(Object),
 }
 
-macro_rules! expect {
-    ($expression:expr, $pattern:pat_param, $resolve:expr) => {{
-        let value = $expression;
-        match value {
-            $pattern => $resolve,
-            _ => return Err(ReaderError::InvalidToken(value)),
-        }
-    }};
-    ($expression:expr, $pattern:pat_param) => {
-        expect!($expression, $pattern, ())
-    };
+/// Represents a KV entry flag
+#[derive(Debug)]
+pub enum Flag {
+    None,
+    Normal(String),
+    Negated(String),
 }
 
 impl Object {
@@ -89,43 +104,238 @@ impl Object {
     /// }
     /// ```
     pub fn from_io<R: Read>(read: R) -> Result<Object> {
-        let mut tokenizer = Tokenizer::from_io(read)?;
+        let mut char_reader = CharReader::from_io(read)?;
 
-        let mut outer_object = Object::default();
-
-        loop {
-            let attemped_entry = Self::read_entry(&mut tokenizer);
-
-            match attemped_entry {
-                Err(ReaderError::InvalidToken(Token::Eof)) => break,
-                Err(err) => return Err(err),
-                Ok((k, v)) => outer_object.kv.insert(k, v),
-            };
-        }
-
-        Ok(outer_object)
+        Ok(Self::visit_object(&mut char_reader)?)
     }
 
-    fn read_entry<R: Read>(tokenizer: &mut Tokenizer<R>) -> Result<(String, Value)> {
-        let key = expect!(tokenizer.next_token()?, Token::Text(text), text);
+    #[inline]
+    fn is_unquoted_text_char(data: &ReadChar) -> bool {
+        match data {
+            ReadChar::Normal(c_data) => match *c_data {
+                OPEN_BLOCK | CLOSE_BLOCK | OPEN_FLAG | QUOTE => false,
+                _ => !c_data.is_whitespace(),
+            },
+            ReadChar::Escaped(_) => true,
+            _ => false,
+        }
+    }
 
-        let val_token = tokenizer.next_token()?;
-        match val_token {
-            Token::Text(val) => Ok((key, Value::String(val))),
-            Token::OpenBlock => {
-                let mut object = Object::default();
+    #[inline]
+    fn advance<R: Read>(char_reader: &mut CharReader<R>) -> Result<()> {
+        char_reader.advance()?;
+        Ok(())
+    }
 
-                loop {
-                    match Self::read_entry(tokenizer) {
-                        Err(ReaderError::InvalidToken(Token::CloseBlock)) => break,
-                        Err(err) => return Err(err),
-                        Ok((k, v)) => object.kv.insert(k, v),
-                    };
+    #[inline]
+    fn advance_whitespace<R: Read>(char_reader: &mut CharReader<R>) -> Result<()> {
+        char_reader.advance()?;
+        if matches!(char_reader.peek(), ReadChar::Whitespace) {
+            char_reader.advance()?;
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn visit_open<R: Read>(char_reader: &mut CharReader<R>) -> Result<()> {
+        debug_assert!(char_reader.peek() == ReadChar::Normal(OPEN_BLOCK));
+        Self::advance_whitespace(char_reader)?;
+
+        Ok(())
+    }
+
+    #[inline]
+    fn visit_close<R: Read>(char_reader: &mut CharReader<R>) -> Result<()> {
+        debug_assert!(char_reader.peek() == ReadChar::Normal(CLOSE_BLOCK));
+        Self::advance_whitespace(char_reader)?;
+
+        Ok(())
+    }
+
+    fn visit_text_quoted<R: Read>(char_reader: &mut CharReader<R>) -> Result<String> {
+        debug_assert!(char_reader.peek() == ReadChar::Normal(QUOTE));
+        Self::advance(char_reader)?;
+
+        let mut read_string = String::with_capacity(BASE_STRING_SIZE);
+
+        while char_reader.peek() != ReadChar::Normal(QUOTE) {
+            let read_peek = char_reader.peek();
+
+            if matches!(read_peek, ReadChar::Eof) {
+                return Err(ReaderError::UnexpectedEof);
+            }
+
+            read_string.push(read_peek.unwrap_char());
+            Self::advance(char_reader)?;
+        }
+        Self::advance_whitespace(char_reader)?;
+
+        read_string.shrink_to_fit();
+        Ok(read_string)
+    }
+
+    fn visit_text_unquoted<R: Read>(char_reader: &mut CharReader<R>) -> Result<String> {
+        debug_assert!(Self::is_unquoted_text_char(&char_reader.peek()));
+
+        let mut read_string = String::with_capacity(BASE_STRING_SIZE);
+
+        while Self::is_unquoted_text_char(&char_reader.peek()) {
+            read_string.push(char_reader.peek().unwrap_char());
+            Self::advance(char_reader)?;
+        }
+
+        if matches!(char_reader.peek(), ReadChar::Whitespace) {
+            Self::advance(char_reader)?;
+        }
+
+        read_string.shrink_to_fit();
+        Ok(read_string)
+    }
+
+    fn visit_text<R: Read>(char_reader: &mut CharReader<R>) -> Result<String> {
+        debug_assert!(char_reader.peek().is_char());
+
+        if char_reader.peek().unwrap_char() == QUOTE {
+            Self::visit_text_quoted(char_reader)
+        } else {
+            Self::visit_text_unquoted(char_reader)
+        }
+    }
+
+    fn visit_flag<R: Read>(char_reader: &mut CharReader<R>) -> Result<Flag> {
+        let first_read = char_reader.peek();
+        if first_read != ReadChar::Normal(OPEN_FLAG) {
+            debug_assert!(
+                first_read.is_eof()
+                    || (first_read.is_char()
+                        && (first_read.unwrap_char() == QUOTE
+                            || first_read.unwrap_char() == CLOSE_BLOCK
+                            || Self::is_unquoted_text_char(&first_read)))
+            );
+
+            return Ok(Flag::None);
+        }
+
+        debug_assert!(char_reader.peek() == ReadChar::Normal(OPEN_FLAG));
+        Self::advance_whitespace(char_reader)?;
+
+        let is_negated = char_reader.peek() == ReadChar::Normal(NEGATE);
+        if is_negated {
+            Self::advance_whitespace(char_reader)?;
+        }
+
+        let mut read_string = String::with_capacity(BASE_STRING_SIZE);
+
+        while char_reader.peek() != ReadChar::Normal(CLOSE_FLAG) {
+            let read_peek = char_reader.peek();
+
+            if matches!(read_peek, ReadChar::Eof) {
+                return Err(ReaderError::UnexpectedEof);
+            }
+
+            read_string.push(read_peek.unwrap_char());
+            Self::advance(char_reader)?;
+        }
+
+        if matches!(char_reader.peek(), ReadChar::Whitespace) {
+            Self::advance(char_reader)?;
+        }
+
+        Self::advance_whitespace(char_reader)?;
+
+        read_string.shrink_to_fit();
+
+        if is_negated {
+            Ok(Flag::Negated(read_string))
+        } else {
+            Ok(Flag::Normal(read_string))
+        }
+    }
+
+    fn visit_value<R: Read>(char_reader: &mut CharReader<R>) -> Result<Value> {
+        let read = char_reader.peek();
+        if read == ReadChar::Normal(OPEN_BLOCK) {
+            Self::visit_open(char_reader)?;
+            let object = Self::visit_object(char_reader)?;
+            Self::visit_close(char_reader)?;
+
+            Ok(Value::Object(object))
+        } else if Self::is_unquoted_text_char(&read) || matches!(read, ReadChar::Normal(QUOTE)) {
+            let text = Self::visit_text(char_reader)?;
+
+            Ok(Value::String(text))
+        } else {
+            Err(ReaderError::InvalidChar(char_reader.peek()))
+        }
+    }
+
+    fn visit_object<R: Read>(char_reader: &mut CharReader<R>) -> Result<Object> {
+        let mut new_obj = Object::default();
+
+        while char_reader.peek() != ReadChar::Eof {
+            let peeked_char = char_reader.peek();
+
+            if peeked_char.is_char() {
+                if peeked_char.unwrap_char() == CLOSE_BLOCK {
+                    break;
                 }
 
-                Ok((key, Value::Object(object)))
+                if peeked_char.unwrap_char() != QUOTE && !Self::is_unquoted_text_char(&peeked_char)
+                {
+                    return Err(ReaderError::InvalidChar(peeked_char));
+                }
+            } else {
+                return Err(ReaderError::InvalidChar(peeked_char));
             }
-            _ => Err(ReaderError::InvalidToken(val_token)),
+
+            let key = Self::visit_text(char_reader)?;
+            let value = Self::visit_value(char_reader)?;
+            let flag = Self::visit_flag(char_reader)?;
+
+            new_obj.kv.insert(key, (flag, value));
+        }
+
+        Ok(new_obj)
+    }
+
+    pub fn get<Q: ?Sized>(&self, k: &Q) -> Option<&Value>
+    where
+        String: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        match self.kv.get(k) {
+            None => None,
+            Some(f_v) => Some(&f_v.1),
+        }
+    }
+
+    pub fn get_with_flags<Q: ?Sized, T: Sized>(&self, k: &Q, flags: HashSet<T>) -> Option<&Value>
+    where
+        String: Borrow<Q>,
+        Q: Hash + Eq,
+        T: Borrow<String>,
+        T: Hash + Eq,
+    {
+        match self.kv.get(k) {
+            None => return None,
+            Some(f_v) => match &f_v.0 {
+                Flag::None => Some(&f_v.1),
+                Flag::Normal(flag) => {
+                    if flags.contains(&flag) {
+                        Some(&f_v.1)
+                    } else {
+                        None
+                    }
+                }
+                Flag::Negated(flag) => {
+                    if !flags.contains(&flag) {
+                        Some(&f_v.1)
+                    } else {
+                        None
+                    }
+                }
+            },
         }
     }
 }
@@ -134,11 +344,18 @@ impl Object {
 mod tests {
     use super::{Object, Value};
 
+    fn string_matches(val: &Value, expected: &str) -> bool {
+        match val {
+            Value::String(v) => v == expected,
+            _ => false,
+        }
+    }
+
     #[test]
     fn single_kv() {
         let object = Object::from_io(r#"key "val""#.as_bytes()).unwrap();
 
-        assert!(*object.kv.get("key").unwrap() == Value::String("val".into()));
+        assert!(string_matches(object.get("key").unwrap(), "val"));
     }
 
     #[test]
@@ -151,8 +368,8 @@ mod tests {
 
         let object = Object::from_io(kv).unwrap();
 
-        assert!(*object.kv.get("key1").unwrap() == Value::String("val1".into()));
-        assert!(*object.kv.get("key2").unwrap() == Value::String("val2".into()));
+        assert!(string_matches(object.get("key1").unwrap(), "val1"));
+        assert!(string_matches(object.get("key2").unwrap(), "val2"));
     }
 
     #[test]
@@ -167,10 +384,10 @@ mod tests {
 
         let object = Object::from_io(kv).unwrap();
 
-        match object.kv.get("comp").unwrap() {
+        match object.get("comp").unwrap() {
             Value::Object(comp) => {
-                assert!(*comp.kv.get("key1").unwrap() == Value::String("val1".into()));
-                assert!(*comp.kv.get("key2").unwrap() == Value::String("val2".into()));
+                assert!(string_matches(comp.get("key1").unwrap(), "val1"));
+                assert!(string_matches(comp.get("key2").unwrap(), "val2"));
             }
             _ => panic!(),
         }

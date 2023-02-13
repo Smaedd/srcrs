@@ -5,15 +5,11 @@ use std::fmt;
 use std::hash::Hash;
 use std::io::Read;
 
-use super::char_reader::{CharReader, ReadChar};
+use bumpalo::collections::String;
+use bumpalo::Bump;
+use ouroboros::self_referencing;
 
-#[derive(Debug, PartialEq)]
-pub enum Token {
-    OpenBlock,
-    CloseBlock,
-    Text(String),
-    Eof,
-}
+use super::char_reader::{CharReader, ReadChar};
 
 const BASE_STRING_SIZE: usize = 1024;
 const QUOTE: char = '"';
@@ -59,28 +55,37 @@ impl Error for ReaderError {
     }
 }
 
+#[self_referencing]
+pub struct KeyValues {
+    allocator: Bump,
+
+    #[borrows(allocator)]
+    #[covariant]
+    root: Object<'this>,
+}
+
 /// Represents a generic KV object.
 #[derive(Debug, Default)]
-pub struct Object {
-    kv: HashMap<String, (Flag, Value)>,
+pub struct Object<'a> {
+    kv: HashMap<String<'a>, (Flag<'a>, Value<'a>)>,
 }
 
 /// Represents a generic KV value.
 #[derive(Debug)]
-pub enum Value {
-    String(String),
-    Object(Object),
+pub enum Value<'a> {
+    String(String<'a>),
+    Object(Object<'a>),
 }
 
 /// Represents a KV entry flag
 #[derive(Debug)]
-pub enum Flag {
+pub enum Flag<'a> {
     None,
-    Normal(String),
-    Negated(String),
+    Normal(String<'a>),
+    Negated(String<'a>),
 }
 
-impl Object {
+impl KeyValues {
     /// Parses a Keyvalues object from an `std::io::Read` object.
     /// # Examples
     /// ```
@@ -103,10 +108,14 @@ impl Object {
     ///     _ => panic!(),
     /// }
     /// ```
-    pub fn from_io<R: Read>(read: R) -> Result<Object> {
+    pub fn from_io<'c, 'b: 'c, R: Read>(read: R) -> Result<KeyValues> {
         let mut char_reader = CharReader::from_io(read)?;
 
-        Ok(Self::visit_object(&mut char_reader)?)
+        KeyValuesTryBuilder {
+            allocator: Bump::with_capacity(1024),
+            root_builder: |allocator: &Bump| Self::visit_object(&mut char_reader, allocator),
+        }
+        .try_build()
     }
 
     #[inline]
@@ -153,11 +162,14 @@ impl Object {
         Ok(())
     }
 
-    fn visit_text_quoted<R: Read>(char_reader: &mut CharReader<R>) -> Result<String> {
+    fn visit_text_quoted<'bump, R: Read>(
+        char_reader: &mut CharReader<R>,
+        allocator: &'bump Bump,
+    ) -> Result<String<'bump>> {
         debug_assert!(char_reader.peek() == ReadChar::Normal(QUOTE));
         Self::advance(char_reader)?;
 
-        let mut read_string = String::with_capacity(BASE_STRING_SIZE);
+        let mut read_string = String::with_capacity_in(BASE_STRING_SIZE, allocator);
 
         while char_reader.peek() != ReadChar::Normal(QUOTE) {
             let read_peek = char_reader.peek();
@@ -175,10 +187,13 @@ impl Object {
         Ok(read_string)
     }
 
-    fn visit_text_unquoted<R: Read>(char_reader: &mut CharReader<R>) -> Result<String> {
+    fn visit_text_unquoted<'bump, R: Read>(
+        char_reader: &mut CharReader<R>,
+        allocator: &'bump Bump,
+    ) -> Result<String<'bump>> {
         debug_assert!(Self::is_unquoted_text_char(&char_reader.peek()));
 
-        let mut read_string = String::with_capacity(BASE_STRING_SIZE);
+        let mut read_string = String::with_capacity_in(BASE_STRING_SIZE, allocator);
 
         while Self::is_unquoted_text_char(&char_reader.peek()) {
             read_string.push(char_reader.peek().unwrap_char());
@@ -193,17 +208,23 @@ impl Object {
         Ok(read_string)
     }
 
-    fn visit_text<R: Read>(char_reader: &mut CharReader<R>) -> Result<String> {
+    fn visit_text<'bump, R: Read>(
+        char_reader: &mut CharReader<R>,
+        allocator: &'bump Bump,
+    ) -> Result<String<'bump>> {
         debug_assert!(char_reader.peek().is_char());
 
         if char_reader.peek().unwrap_char() == QUOTE {
-            Self::visit_text_quoted(char_reader)
+            Self::visit_text_quoted(char_reader, allocator)
         } else {
-            Self::visit_text_unquoted(char_reader)
+            Self::visit_text_unquoted(char_reader, allocator)
         }
     }
 
-    fn visit_flag<R: Read>(char_reader: &mut CharReader<R>) -> Result<Flag> {
+    fn visit_flag<'bump, R: Read>(
+        char_reader: &mut CharReader<R>,
+        allocator: &'bump Bump,
+    ) -> Result<Flag<'bump>> {
         let first_read = char_reader.peek();
         if first_read != ReadChar::Normal(OPEN_FLAG) {
             debug_assert!(
@@ -225,7 +246,7 @@ impl Object {
             Self::advance_whitespace(char_reader)?;
         }
 
-        let mut read_string = String::with_capacity(BASE_STRING_SIZE);
+        let mut read_string = String::with_capacity_in(BASE_STRING_SIZE, allocator);
 
         while char_reader.peek() != ReadChar::Normal(CLOSE_FLAG) {
             let read_peek = char_reader.peek();
@@ -253,16 +274,19 @@ impl Object {
         }
     }
 
-    fn visit_value<R: Read>(char_reader: &mut CharReader<R>) -> Result<Value> {
+    fn visit_value<'bump, R: Read>(
+        char_reader: &mut CharReader<R>,
+        allocator: &'bump Bump,
+    ) -> Result<Value<'bump>> {
         let read = char_reader.peek();
         if read == ReadChar::Normal(OPEN_BLOCK) {
             Self::visit_open(char_reader)?;
-            let object = Self::visit_object(char_reader)?;
+            let object = Self::visit_object(char_reader, allocator)?;
             Self::visit_close(char_reader)?;
 
             Ok(Value::Object(object))
         } else if Self::is_unquoted_text_char(&read) || matches!(read, ReadChar::Normal(QUOTE)) {
-            let text = Self::visit_text(char_reader)?;
+            let text = Self::visit_text(char_reader, allocator)?;
 
             Ok(Value::String(text))
         } else {
@@ -270,7 +294,10 @@ impl Object {
         }
     }
 
-    fn visit_object<R: Read>(char_reader: &mut CharReader<R>) -> Result<Object> {
+    fn visit_object<'bump, R: Read>(
+        char_reader: &mut CharReader<R>,
+        allocator: &'bump Bump,
+    ) -> Result<Object<'bump>> {
         let mut new_obj = Object::default();
 
         while char_reader.peek() != ReadChar::Eof {
@@ -289,9 +316,9 @@ impl Object {
                 return Err(ReaderError::InvalidChar(peeked_char));
             }
 
-            let key = Self::visit_text(char_reader)?;
-            let value = Self::visit_value(char_reader)?;
-            let flag = Self::visit_flag(char_reader)?;
+            let key = Self::visit_text(char_reader, allocator)?;
+            let value = Self::visit_value(char_reader, allocator)?;
+            let flag = Self::visit_flag(char_reader, allocator)?;
 
             new_obj.kv.insert(key, (flag, value));
         }
@@ -301,7 +328,27 @@ impl Object {
 
     pub fn get<Q: ?Sized>(&self, k: &Q) -> Option<&Value>
     where
-        String: Borrow<Q>,
+        for<'b> String<'b>: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        self.borrow_root().get(k)
+    }
+
+    pub fn get_with_flags<Q: ?Sized, T: Sized>(&self, k: &Q, flags: HashSet<T>) -> Option<&Value>
+    where
+        for<'b> String<'b>: Borrow<Q>,
+        Q: Hash + Eq,
+        for<'b> T: Borrow<String<'b>>,
+        T: Hash + Eq,
+    {
+        self.borrow_root().get_with_flags(k, flags)
+    }
+}
+
+impl<'a> Object<'a> {
+    pub fn get<Q: ?Sized>(&self, k: &Q) -> Option<&Value>
+    where
+        String<'a>: Borrow<Q>,
         Q: Hash + Eq,
     {
         match self.kv.get(k) {
@@ -312,9 +359,9 @@ impl Object {
 
     pub fn get_with_flags<Q: ?Sized, T: Sized>(&self, k: &Q, flags: HashSet<T>) -> Option<&Value>
     where
-        String: Borrow<Q>,
+        String<'a>: Borrow<Q>,
         Q: Hash + Eq,
-        T: Borrow<String>,
+        T: Borrow<String<'a>>,
         T: Hash + Eq,
     {
         match self.kv.get(k) {
@@ -342,7 +389,7 @@ impl Object {
 
 #[cfg(test)]
 mod tests {
-    use super::{Object, Value};
+    use super::{KeyValues, Value};
 
     fn string_matches(val: &Value, expected: &str) -> bool {
         match val {
@@ -353,7 +400,7 @@ mod tests {
 
     #[test]
     fn single_kv() {
-        let object = Object::from_io(r#"key "val""#.as_bytes()).unwrap();
+        let object = KeyValues::from_io(r#"key "val""#.as_bytes()).unwrap();
 
         assert!(string_matches(object.get("key").unwrap(), "val"));
     }
@@ -366,7 +413,7 @@ mod tests {
         "#
         .as_bytes();
 
-        let object = Object::from_io(kv).unwrap();
+        let object = KeyValues::from_io(kv).unwrap();
 
         assert!(string_matches(object.get("key1").unwrap(), "val1"));
         assert!(string_matches(object.get("key2").unwrap(), "val2"));
@@ -382,7 +429,7 @@ mod tests {
         "#
         .as_bytes();
 
-        let object = Object::from_io(kv).unwrap();
+        let object = KeyValues::from_io(kv).unwrap();
 
         match object.get("comp").unwrap() {
             Value::Object(comp) => {

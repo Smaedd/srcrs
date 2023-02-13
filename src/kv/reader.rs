@@ -4,25 +4,20 @@ use std::error::Error;
 use std::fmt;
 use std::hash::Hash;
 use std::io::Read;
+use std::mem;
 
 use bumpalo::collections::String;
 use bumpalo::Bump;
 use ouroboros::self_referencing;
 
-use super::char_reader::{CharReader, ReadChar};
+use super::token_reader::{self, Token, TokenReader};
 
 const BASE_STRING_SIZE: usize = 1024;
-const QUOTE: char = '"';
-const OPEN_BLOCK: char = '{';
-const CLOSE_BLOCK: char = '}';
-const OPEN_FLAG: char = '[';
-const CLOSE_FLAG: char = ']';
-const NEGATE: char = '!';
 
 #[derive(Debug)]
 pub enum ReaderError {
     IO(std::io::Error),
-    InvalidChar(ReadChar),
+    InvalidToken(std::string::String),
     UnexpectedEof,
 }
 pub type Result<T> = std::result::Result<T, ReaderError>;
@@ -39,7 +34,7 @@ impl fmt::Display for ReaderError {
             ReaderError::IO(err) => {
                 write!(f, "IO error encountered in reading:\n\t{}", err.to_string())
             }
-            ReaderError::InvalidChar(data) => write!(f, "Invalid char: {data:?}"),
+            ReaderError::InvalidToken(data) => write!(f, "Invalid token: {data}"),
             ReaderError::UnexpectedEof => write!(f, "Unexpected EOF"),
         }
     }
@@ -49,7 +44,7 @@ impl Error for ReaderError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             ReaderError::IO(ref err) => Some(err),
-            ReaderError::InvalidChar(_) => None,
+            ReaderError::InvalidToken(_) => None,
             ReaderError::UnexpectedEof => None,
         }
     }
@@ -109,218 +104,134 @@ impl KeyValues {
     /// }
     /// ```
     pub fn from_io<'c, 'b: 'c, R: Read>(read: R) -> Result<KeyValues> {
-        let mut char_reader = CharReader::from_io(read)?;
-
         KeyValuesTryBuilder {
             allocator: Bump::with_capacity(1024),
-            root_builder: |allocator: &Bump| Self::visit_object(&mut char_reader, allocator),
+            root_builder: |allocator: &Bump| {
+                let mut token_reader = TokenReader::from_io(read, allocator)?;
+                Self::visit_object(&mut token_reader)
+            },
         }
         .try_build()
     }
 
     #[inline]
-    fn is_unquoted_text_char(data: &ReadChar) -> bool {
-        match data {
-            ReadChar::Normal(c_data) => match *c_data {
-                OPEN_BLOCK | CLOSE_BLOCK | OPEN_FLAG | QUOTE => false,
-                _ => !c_data.is_whitespace(),
-            },
-            ReadChar::Escaped(_) => true,
-            _ => false,
-        }
-    }
-
-    #[inline]
-    fn advance<R: Read>(char_reader: &mut CharReader<R>) -> Result<()> {
-        char_reader.advance()?;
-        Ok(())
-    }
-
-    #[inline]
-    fn advance_whitespace<R: Read>(char_reader: &mut CharReader<R>) -> Result<()> {
-        char_reader.advance()?;
-        if matches!(char_reader.peek(), ReadChar::Whitespace) {
-            char_reader.advance()?;
-        }
+    fn visit_open_block<'bump, R: Read>(token_reader: &mut TokenReader<'bump, R>) -> Result<()> {
+        debug_assert!(*token_reader.peek() == Token::OpenBlock);
+        token_reader.advance()?;
 
         Ok(())
     }
 
     #[inline]
-    fn visit_open<R: Read>(char_reader: &mut CharReader<R>) -> Result<()> {
-        debug_assert!(char_reader.peek() == ReadChar::Normal(OPEN_BLOCK));
-        Self::advance_whitespace(char_reader)?;
+    fn visit_close_block<'bump, R: Read>(token_reader: &mut TokenReader<'bump, R>) -> Result<()> {
+        debug_assert!(*token_reader.peek() == Token::CloseBlock);
+        token_reader.advance()?;
 
         Ok(())
     }
 
     #[inline]
-    fn visit_close<R: Read>(char_reader: &mut CharReader<R>) -> Result<()> {
-        debug_assert!(char_reader.peek() == ReadChar::Normal(CLOSE_BLOCK));
-        Self::advance_whitespace(char_reader)?;
+    fn visit_open_flag<'bump, R: Read>(token_reader: &mut TokenReader<'bump, R>) -> Result<()> {
+        debug_assert!(*token_reader.peek() == Token::OpenFlag);
+        token_reader.advance()?;
 
         Ok(())
     }
 
-    fn visit_text_quoted<'bump, R: Read>(
-        char_reader: &mut CharReader<R>,
-        allocator: &'bump Bump,
-    ) -> Result<String<'bump>> {
-        debug_assert!(char_reader.peek() == ReadChar::Normal(QUOTE));
-        Self::advance(char_reader)?;
+    #[inline]
+    fn visit_close_flag<'bump, R: Read>(token_reader: &mut TokenReader<'bump, R>) -> Result<()> {
+        debug_assert!(*token_reader.peek() == Token::CloseFlag);
+        token_reader.advance()?;
 
-        let mut read_string = String::with_capacity_in(BASE_STRING_SIZE, allocator);
-
-        while char_reader.peek() != ReadChar::Normal(QUOTE) {
-            let read_peek = char_reader.peek();
-
-            if matches!(read_peek, ReadChar::Eof) {
-                return Err(ReaderError::UnexpectedEof);
-            }
-
-            read_string.push(read_peek.unwrap_char());
-            Self::advance(char_reader)?;
-        }
-        Self::advance_whitespace(char_reader)?;
-
-        read_string.shrink_to_fit();
-        Ok(read_string)
+        Ok(())
     }
 
-    fn visit_text_unquoted<'bump, R: Read>(
-        char_reader: &mut CharReader<R>,
-        allocator: &'bump Bump,
-    ) -> Result<String<'bump>> {
-        debug_assert!(Self::is_unquoted_text_char(&char_reader.peek()));
-
-        let mut read_string = String::with_capacity_in(BASE_STRING_SIZE, allocator);
-
-        while Self::is_unquoted_text_char(&char_reader.peek()) {
-            read_string.push(char_reader.peek().unwrap_char());
-            Self::advance(char_reader)?;
+    #[inline]
+    fn visit_flag_negation<'bump, R: Read>(
+        token_reader: &mut TokenReader<'bump, R>,
+    ) -> Result<bool> {
+        if matches!(*token_reader.peek(), Token::Negate) {
+            token_reader.advance()?;
+            return Ok(true);
         }
 
-        if matches!(char_reader.peek(), ReadChar::Whitespace) {
-            Self::advance(char_reader)?;
-        }
-
-        read_string.shrink_to_fit();
-        Ok(read_string)
+        Ok(false)
     }
 
+    #[inline]
     fn visit_text<'bump, R: Read>(
-        char_reader: &mut CharReader<R>,
-        allocator: &'bump Bump,
+        token_reader: &mut TokenReader<'bump, R>,
     ) -> Result<String<'bump>> {
-        debug_assert!(char_reader.peek().is_char());
+        debug_assert!(matches!(*token_reader.peek(), Token::Text(_)));
 
-        if char_reader.peek().unwrap_char() == QUOTE {
-            Self::visit_text_quoted(char_reader, allocator)
-        } else {
-            Self::visit_text_unquoted(char_reader, allocator)
-        }
+        let text = token_reader.peek().unwrap_text();
+        token_reader.advance()?;
+        Ok(text)
     }
 
-    fn visit_flag<'bump, R: Read>(
-        char_reader: &mut CharReader<R>,
-        allocator: &'bump Bump,
-    ) -> Result<Flag<'bump>> {
-        let first_read = char_reader.peek();
-        if first_read != ReadChar::Normal(OPEN_FLAG) {
-            debug_assert!(
-                first_read.is_eof()
-                    || (first_read.is_char()
-                        && (first_read.unwrap_char() == QUOTE
-                            || first_read.unwrap_char() == CLOSE_BLOCK
-                            || Self::is_unquoted_text_char(&first_read)))
-            );
-
+    fn visit_flag<'bump, R: Read>(token_reader: &mut TokenReader<'bump, R>) -> Result<Flag<'bump>> {
+        if !matches!(token_reader.peek(), Token::OpenFlag) {
             return Ok(Flag::None);
         }
 
-        debug_assert!(char_reader.peek() == ReadChar::Normal(OPEN_FLAG));
-        Self::advance_whitespace(char_reader)?;
+        Self::visit_open_flag(token_reader)?;
+        let negated = Self::visit_flag_negation(token_reader)?;
+        let text = Self::visit_text(token_reader)?;
+        Self::visit_close_flag(token_reader)?;
 
-        let is_negated = char_reader.peek() == ReadChar::Normal(NEGATE);
-        if is_negated {
-            Self::advance_whitespace(char_reader)?;
-        }
-
-        let mut read_string = String::with_capacity_in(BASE_STRING_SIZE, allocator);
-
-        while char_reader.peek() != ReadChar::Normal(CLOSE_FLAG) {
-            let read_peek = char_reader.peek();
-
-            if matches!(read_peek, ReadChar::Eof) {
-                return Err(ReaderError::UnexpectedEof);
-            }
-
-            read_string.push(read_peek.unwrap_char());
-            Self::advance(char_reader)?;
-        }
-
-        if matches!(char_reader.peek(), ReadChar::Whitespace) {
-            Self::advance(char_reader)?;
-        }
-
-        Self::advance_whitespace(char_reader)?;
-
-        read_string.shrink_to_fit();
-
-        if is_negated {
-            Ok(Flag::Negated(read_string))
+        if negated {
+            Ok(Flag::Negated(text))
         } else {
-            Ok(Flag::Normal(read_string))
+            Ok(Flag::Normal(text))
         }
     }
 
     fn visit_value<'bump, R: Read>(
-        char_reader: &mut CharReader<R>,
-        allocator: &'bump Bump,
+        token_reader: &mut TokenReader<'bump, R>,
     ) -> Result<Value<'bump>> {
-        let read = char_reader.peek();
-        if read == ReadChar::Normal(OPEN_BLOCK) {
-            Self::visit_open(char_reader)?;
-            let object = Self::visit_object(char_reader, allocator)?;
-            Self::visit_close(char_reader)?;
+        match token_reader.peek() {
+            Token::OpenBlock => {
+                Self::visit_open_block(token_reader)?;
+                let object = Self::visit_object(token_reader)?;
+                Self::visit_close_block(token_reader)?;
 
-            Ok(Value::Object(object))
-        } else if Self::is_unquoted_text_char(&read) || matches!(read, ReadChar::Normal(QUOTE)) {
-            let text = Self::visit_text(char_reader, allocator)?;
+                Ok(Value::Object(object))
+            }
+            Token::Text(text) => {
+                let moved = mem::replace(text, String::new_in(text.bump()));
 
-            Ok(Value::String(text))
-        } else {
-            Err(ReaderError::InvalidChar(char_reader.peek()))
+                token_reader.advance()?;
+                Ok(Value::String(moved))
+            }
+            _ => Err(ReaderError::InvalidToken(format!(
+                "{:?}",
+                *token_reader.peek()
+            ))),
         }
     }
 
     fn visit_object<'bump, R: Read>(
-        char_reader: &mut CharReader<R>,
-        allocator: &'bump Bump,
+        token_reader: &mut TokenReader<'bump, R>,
     ) -> Result<Object<'bump>> {
         let mut new_obj = Object::default();
 
-        while char_reader.peek() != ReadChar::Eof {
-            let peeked_char = char_reader.peek();
+        while !matches!(token_reader.peek(), Token::Eof) {
+            match token_reader.peek() {
+                Token::CloseBlock => break,
+                Token::Text(_) => {
+                    let key = Self::visit_text(token_reader)?;
+                    let value = Self::visit_value(token_reader)?;
+                    let flag = Self::visit_flag(token_reader)?;
 
-            if peeked_char.is_char() {
-                if peeked_char.unwrap_char() == CLOSE_BLOCK {
-                    break;
+                    new_obj.kv.insert(key, (flag, value));
                 }
-
-                if peeked_char.unwrap_char() != QUOTE && !Self::is_unquoted_text_char(&peeked_char)
-                {
-                    return Err(ReaderError::InvalidChar(peeked_char));
+                _ => {
+                    return Err(ReaderError::InvalidToken(format!(
+                        "{:?}",
+                        *token_reader.peek()
+                    )))
                 }
-            } else {
-                return Err(ReaderError::InvalidChar(peeked_char));
             }
-
-            let key = Self::visit_text(char_reader, allocator)?;
-            let value = Self::visit_value(char_reader, allocator)?;
-            let flag = Self::visit_flag(char_reader, allocator)?;
-
-            new_obj.kv.insert(key, (flag, value));
         }
 
         Ok(new_obj)

@@ -243,11 +243,11 @@ impl KeyValues {
         self.borrow_root().get(k)
     }
 
-    pub fn get_with_flags<Q: ?Sized, T: Sized>(&self, k: &Q, flags: HashSet<T>) -> Option<&Value>
+    pub fn get_with_flags<Q: ?Sized, T: Sized>(&self, k: &Q, flags: &HashSet<T>) -> Option<&Value>
     where
         for<'b> String<'b>: Borrow<Q>,
         Q: Hash + Eq,
-        for<'b> T: Borrow<String<'b>>,
+        T: Borrow<str>,
         T: Hash + Eq,
     {
         self.borrow_root().get_with_flags(k, flags)
@@ -266,11 +266,11 @@ impl<'a> Object<'a> {
         }
     }
 
-    pub fn get_with_flags<Q: ?Sized, T: Sized>(&self, k: &Q, flags: HashSet<T>) -> Option<&Value>
+    pub fn get_with_flags<Q: ?Sized, T: Sized>(&self, k: &Q, flags: &HashSet<T>) -> Option<&Value>
     where
         String<'a>: Borrow<Q>,
         Q: Hash + Eq,
-        T: Borrow<String<'a>>,
+        T: Borrow<str>,
         T: Hash + Eq,
     {
         match self.kv.get(k) {
@@ -278,14 +278,14 @@ impl<'a> Object<'a> {
             Some(f_v) => match &f_v.0 {
                 Flag::None => Some(&f_v.1),
                 Flag::Normal(flag) => {
-                    if flags.contains(&flag) {
+                    if flags.contains(flag.as_str()) {
                         Some(&f_v.1)
                     } else {
                         None
                     }
                 }
                 Flag::Negated(flag) => {
-                    if !flags.contains(&flag) {
+                    if !flags.contains(flag.as_str()) {
                         Some(&f_v.1)
                     } else {
                         None
@@ -298,6 +298,8 @@ impl<'a> Object<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{KeyValues, Value};
 
     fn string_matches(val: &Value, expected: &str) -> bool {
@@ -344,6 +346,40 @@ mod tests {
             Value::Object(comp) => {
                 assert!(string_matches(comp.get("key1").unwrap(), "val1"));
                 assert!(string_matches(comp.get("key2").unwrap(), "val2"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn compound_kv_with_flags() {
+        let kv = r#"
+        comp {
+            key1 val1 [test]
+            key2 val2 [!test]
+        }
+        "#
+        .as_bytes();
+
+        let object = KeyValues::from_io(kv).unwrap();
+
+        match object.get("comp").unwrap() {
+            Value::Object(comp) => {
+                assert!(string_matches(comp.get("key1").unwrap(), "val1"));
+                assert!(string_matches(comp.get("key2").unwrap(), "val2"));
+            }
+            _ => panic!(),
+        }
+
+        let flags: HashSet<&str> = vec!["test"].into_iter().collect();
+
+        match object.get("comp").unwrap() {
+            Value::Object(comp) => {
+                assert!(string_matches(
+                    comp.get_with_flags("key1", &flags).unwrap(),
+                    "val1"
+                ));
+                assert!(comp.get_with_flags("key2", &flags).is_none());
             }
             _ => panic!(),
         }

@@ -1,5 +1,5 @@
 #[cfg(test)]
-use crate::vpk::{File, VPK};
+use crate::vpk::VPK;
 
 use std::io::Seek;
 #[cfg(test)]

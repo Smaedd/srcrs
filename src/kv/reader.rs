@@ -10,9 +10,7 @@ use bumpalo::collections::String;
 use bumpalo::Bump;
 use ouroboros::self_referencing;
 
-use super::token_reader::{self, Token, TokenReader};
-
-const BASE_STRING_SIZE: usize = 1024;
+use super::token_reader::{Token, TokenReader};
 
 #[derive(Debug)]
 pub enum ReaderError {

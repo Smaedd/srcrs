@@ -28,8 +28,6 @@ struct VPKHeaderV2 {
     signature_section_size: u32,
 }
 
-const DIRECTORY_ENTRY_TERMINATOR: u16 = 0xFFFF;
-
 #[repr(C, packed)]
 #[derive(FromBytes)]
 struct VPKDirectoryEntry {
@@ -44,7 +42,6 @@ struct VPKDirectoryEntry {
 }
 
 const VPK_SIGNATURE: u32 = 0x55aa1234;
-const VPK_VERSION: u32 = 2;
 
 pub struct VPK {
     path: PathBuf,

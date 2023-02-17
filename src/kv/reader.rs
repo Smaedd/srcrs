@@ -1,5 +1,5 @@
 use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::hash::Hash;
@@ -8,6 +8,7 @@ use std::mem;
 
 use bumpalo::collections::String;
 use bumpalo::Bump;
+use multimap::MultiMap;
 use ouroboros::self_referencing;
 
 use super::token_reader::{Token, TokenReader};
@@ -60,7 +61,7 @@ pub struct KeyValues {
 /// Represents a generic KV object.
 #[derive(Debug, Default)]
 pub struct Object<'a> {
-    kv: HashMap<String<'a>, (Flag<'a>, Value<'a>)>,
+    kv: MultiMap<String<'a>, (Flag<'a>, Value<'a>)>,
 }
 
 /// Represents a generic KV value.
